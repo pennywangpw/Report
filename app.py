@@ -1,9 +1,14 @@
 import io
+from datetime import datetime
+
+import altair as alt
 import streamlit as st
 import pandas as pd
 
-from modules.database import init_db, upsert_records
+from modules.database import init_db, upsert_records, get_available_options
 from modules.etl import auto_identify, transform
+from modules.analysis import parse_option, get_record, compare, COMPARISON_LABELS
+from modules.export import to_excel, to_pdf
 
 # ── 初始化 ────────────────────────────────────────────────────────────────────
 init_db()
@@ -19,13 +24,13 @@ st.title("📊 財務營運管理系統")
 # ── 側邊欄導航 ────────────────────────────────────────────────────────────────
 module = st.sidebar.radio(
     "功能模組",
-    ["模組 A：數據管理", "模組 B：數據分析（開發中）"],
+    ["模組 A：數據管理", "模組 B：數據分析"],
 )
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 模組 A：數據管理
 # ═══════════════════════════════════════════════════════════════════════════════
-if module == "模組 A：數據管理":
+if module == "模組 A：數據管理":  # noqa: SIM102
     st.header("模組 A：數據管理")
 
     # ── A-3 批次上傳 ──────────────────────────────────────────────────────────
@@ -137,8 +142,209 @@ if module == "模組 A：數據管理":
                         st.text(err)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 模組 B（placeholder）
+# 模組 B：數據分析
 # ═══════════════════════════════════════════════════════════════════════════════
 else:
     st.header("模組 B：數據分析")
-    st.info("模組 B 開發中，請先完成模組 A 的資料匯入。")
+
+    # ── B-1 雙對象選擇器 ──────────────────────────────────────────────────────
+    options = get_available_options()
+    if len(options) < 2:
+        st.warning("資料庫中的記錄不足（至少需要 2 筆），請先至模組 A 上傳資料。")
+        st.stop()
+
+    st.subheader("B-1 選擇對比對象")
+    col_b, col_c = st.columns(2)
+    with col_b:
+        base_opt = st.selectbox("基準對象", options, key="base_opt")
+    with col_c:
+        comp_options = [o for o in options if o != base_opt]
+        comp_opt = st.selectbox("對比對象", comp_options, key="comp_opt")
+
+    # ── OpEx 閾值設定 ─────────────────────────────────────────────────────────
+    with st.sidebar:
+        st.divider()
+        st.markdown("**⚙ 分析設定**")
+        opex_threshold = st.slider("OpEx% 警示閾值", 5, 50, 20, step=1,
+                                   help="超過此費用率時顯示警示")
+
+    # ── 讀取資料 & 計算 ───────────────────────────────────────────────────────
+    base_site, base_ym, base_dtype = parse_option(base_opt)
+    comp_site, comp_ym, comp_dtype = parse_option(comp_opt)
+
+    base_rec = get_record(base_site, base_ym, base_dtype)
+    comp_rec = get_record(comp_site, comp_ym, comp_dtype)
+
+    if base_rec is None or comp_rec is None:
+        st.error("無法從資料庫讀取選定記錄，請確認資料完整性。")
+        st.stop()
+
+    result = compare(base_rec, comp_rec, opex_threshold=opex_threshold)
+
+    # ── B-2 對比類型標籤 ──────────────────────────────────────────────────────
+    st.divider()
+    st.subheader(f"B-2 {result['comparison_label']}")
+    st.caption(f"基準：**{base_opt}**　→　對比：**{comp_opt}**")
+
+    # ── B-3 KPI Cards ─────────────────────────────────────────────────────────
+    st.subheader("B-3 核心指標")
+
+    def _fmt(val, suffix="", decimals=1):
+        if val is None:
+            return "N/A"
+        return f"{val:,.{decimals}f}{suffix}"
+
+    def _delta_str(val, pct):
+        if val is None:
+            return "N/A"
+        sign = "+" if val >= 0 else ""
+        pct_s = f" ({sign}{pct:.1f}%)" if pct is not None else ""
+        return f"{sign}{val:,.1f}{pct_s}"
+
+    bm = result["base_metrics"]
+    cm = result["comp_metrics"]
+
+    # 營收
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.metric("營收 Revenue",
+                  _fmt(cm["revenue"]),
+                  _delta_str(result["revenue_delta"], result["revenue_delta_pct"]))
+    with c2:
+        st.metric("毛利 Gross Profit",
+                  _fmt(cm["gross_profit"]),
+                  _delta_str(result["gp_delta"], result["gp_delta_pct"]))
+    with c3:
+        gm_delta = (cm["gross_margin_pct"] or 0) - (bm["gross_margin_pct"] or 0)
+        st.metric("毛利率 GM%",
+                  _fmt(cm["gross_margin_pct"], "%"),
+                  f"{'+' if gm_delta >= 0 else ''}{gm_delta:.1f}%")
+    with c4:
+        opex_pct_delta = result["opex_pct_delta"]
+        alert_icon = " ⚠" if result["comp_opex_alert"] else ""
+        st.metric(f"費用率 OpEx%{alert_icon}",
+                  _fmt(cm["opex_pct"], "%"),
+                  f"{'+' if opex_pct_delta >= 0 else ''}{opex_pct_delta:.1f}%")
+
+    # OpEx 預警提示
+    if result["base_opex_alert"] or result["comp_opex_alert"]:
+        msgs = []
+        if result["base_opex_alert"]:
+            msgs.append(f"**基準** {base_opt} OpEx% = {_fmt(bm['opex_pct'], '%')} 超過 {opex_threshold}% 閾值")
+        if result["comp_opex_alert"]:
+            msgs.append(f"**對比** {comp_opt} OpEx% = {_fmt(cm['opex_pct'], '%')} 超過 {opex_threshold}% 閾值")
+        st.warning("⚠ 費用率超標警示\n\n" + "\n\n".join(msgs))
+
+    # ── B-3 圖表 ──────────────────────────────────────────────────────────────
+    st.subheader("圖表對比")
+    base_label = f"{base_site}/{base_ym}"
+    comp_label = f"{comp_site}/{comp_ym}"
+
+    tab_bar, tab_line, tab_opex = st.tabs(["營收 & 毛利 Bar", "趨勢 Line", "費用率 Bar"])
+
+    with tab_bar:
+        grouped_df = pd.DataFrame([
+            {"項目": m, "對象": base_label, "金額": v}
+            for m, v in [
+                ("Revenue",     bm["revenue"]),
+                ("Gross Profit", bm["gross_profit"]),
+                ("OpEx",        bm["opex"]),
+            ]
+        ] + [
+            {"項目": m, "對象": comp_label, "金額": v}
+            for m, v in [
+                ("Revenue",     cm["revenue"]),
+                ("Gross Profit", cm["gross_profit"]),
+                ("OpEx",        cm["opex"]),
+            ]
+        ])
+        grouped_chart = (
+            alt.Chart(grouped_df)
+            .mark_bar()
+            .encode(
+                x=alt.X("項目:N", title=None,
+                        sort=["Revenue", "Gross Profit", "OpEx"],
+                        axis=alt.Axis(labelAngle=0)),
+                xOffset=alt.XOffset("對象:N"),
+                y=alt.Y("金額:Q", title="Amount"),
+                color=alt.Color("對象:N",
+                                scale=alt.Scale(scheme="tableau10"),
+                                legend=alt.Legend(title="對象")),
+                tooltip=["項目", "對象", alt.Tooltip("金額:Q", format=",.1f")],
+            )
+            .properties(height=380)
+        )
+        st.altair_chart(grouped_chart, use_container_width=True)
+
+    with tab_line:
+        trend_df = pd.DataFrame({
+            "指標": ["Revenue", "COGS", "Gross Profit", "OpEx"],
+            base_label: [bm["revenue"], bm["cogs"], bm["gross_profit"], bm["opex"]],
+            comp_label: [cm["revenue"], cm["cogs"], cm["gross_profit"], cm["opex"]],
+        }).set_index("指標")
+        st.line_chart(trend_df)
+
+    with tab_opex:
+        opex_df = pd.DataFrame({
+            "對象": [base_label, comp_label],
+            "OpEx%": [bm["opex_pct"] or 0, cm["opex_pct"] or 0],
+            "GM%":   [bm["gross_margin_pct"] or 0, cm["gross_margin_pct"] or 0],
+        }).set_index("對象")
+        st.bar_chart(opex_df)
+
+    # ── 詳細數據表 ────────────────────────────────────────────────────────────
+    with st.expander("詳細數據表"):
+        detail_df = pd.DataFrame({
+            "指標": ["Revenue", "COGS", "Gross Profit", "Gross Margin%", "OpEx", "OpEx%"],
+            base_label: [
+                bm["revenue"], bm["cogs"], bm["gross_profit"],
+                bm["gross_margin_pct"], bm["opex"], bm["opex_pct"],
+            ],
+            comp_label: [
+                cm["revenue"], cm["cogs"], cm["gross_profit"],
+                cm["gross_margin_pct"], cm["opex"], cm["opex_pct"],
+            ],
+            "增減額 / Δppt": [
+                result["revenue_delta"],
+                cm["cogs"] - bm["cogs"],
+                result["gp_delta"],
+                (cm["gross_margin_pct"] or 0) - (bm["gross_margin_pct"] or 0),
+                result["opex_delta"],
+                result["opex_pct_delta"],
+            ],
+            "增減率%": [
+                result["revenue_delta_pct"],
+                None,
+                result["gp_delta_pct"],
+                None, None, None,
+            ],
+        })
+        st.dataframe(detail_df, use_container_width=True)
+
+    # ── B-4 匯出 ──────────────────────────────────────────────────────────────
+    st.subheader("B-4 報告匯出")
+    exp_col1, exp_col2 = st.columns(2)
+
+    with exp_col1:
+        if st.button("產生 Excel 報告"):
+            with st.spinner("產生中…"):
+                xlsx_bytes = to_excel(result)
+            fname = f"report_{base_site}_{comp_site}_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
+            st.download_button(
+                label="⬇ 下載 Excel",
+                data=xlsx_bytes,
+                file_name=fname,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+    with exp_col2:
+        if st.button("產生 PDF 報告"):
+            with st.spinner("產生中…"):
+                pdf_bytes = to_pdf(result)
+            fname = f"report_{base_site}_{comp_site}_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf"
+            st.download_button(
+                label="⬇ 下載 PDF",
+                data=pdf_bytes,
+                file_name=fname,
+                mime="application/pdf",
+            )
