@@ -1,6 +1,7 @@
 import io
 from datetime import datetime
 
+import altair as alt
 import streamlit as st
 import pandas as pd
 
@@ -242,12 +243,38 @@ else:
     tab_bar, tab_line, tab_opex = st.tabs(["營收 & 毛利 Bar", "趨勢 Line", "費用率 Bar"])
 
     with tab_bar:
-        chart_df = pd.DataFrame({
-            "項目": ["Revenue", "Gross Profit", "OpEx"],
-            base_label: [bm["revenue"], bm["gross_profit"], bm["opex"]],
-            comp_label: [cm["revenue"], cm["gross_profit"], cm["opex"]],
-        }).set_index("項目")
-        st.bar_chart(chart_df)
+        grouped_df = pd.DataFrame([
+            {"項目": m, "對象": base_label, "金額": v}
+            for m, v in [
+                ("Revenue",     bm["revenue"]),
+                ("Gross Profit", bm["gross_profit"]),
+                ("OpEx",        bm["opex"]),
+            ]
+        ] + [
+            {"項目": m, "對象": comp_label, "金額": v}
+            for m, v in [
+                ("Revenue",     cm["revenue"]),
+                ("Gross Profit", cm["gross_profit"]),
+                ("OpEx",        cm["opex"]),
+            ]
+        ])
+        grouped_chart = (
+            alt.Chart(grouped_df)
+            .mark_bar()
+            .encode(
+                x=alt.X("項目:N", title=None,
+                        sort=["Revenue", "Gross Profit", "OpEx"],
+                        axis=alt.Axis(labelAngle=0)),
+                xOffset=alt.XOffset("對象:N"),
+                y=alt.Y("金額:Q", title="Amount"),
+                color=alt.Color("對象:N",
+                                scale=alt.Scale(scheme="tableau10"),
+                                legend=alt.Legend(title="對象")),
+                tooltip=["項目", "對象", alt.Tooltip("金額:Q", format=",.1f")],
+            )
+            .properties(height=380)
+        )
+        st.altair_chart(grouped_chart, use_container_width=True)
 
     with tab_line:
         trend_df = pd.DataFrame({
